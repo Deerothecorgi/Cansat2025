@@ -1,136 +1,97 @@
-#include <SPI.h>
-#include <LoRa.h>
 #include <Wire.h>
+#include <MPU6050.h>
 #include <SoftwareSerial.h>
 #include <TinyGPS++.h>
-#include <Servo.h>
+#include <math.h>
+#include <SPI.h>
 #include <SD.h>
+#include <LoRa.h>
+#include <OV7670.h>
 
- // ----- Pin Definitions for Arduino Uno -----
-#define LORA_SS   10     // LoRa module Chip Select
-#define LORA_RST  9      // LoRa module Reset
-#define LORA_DIO0 2      // LoRa module DIO0
+// กำหนด Pin
+#define MQ135_NH3_Pin A0 // Pin ของ MQ-135 เพื่อวัด NH3 
+#define MQ135_NOx_Pin A1 // Pin ของ MQ-135 เพื่อวัด NOx
+#define RXPin 3 // Pin RX ของ GPS
+#define TXPin 2 // Pin TX ของ GPS
+#define GPSBaud 9600 // Baud Rate ของ GPS
+#define LORA_SS 10 // Pin SS ของ Lora Module
+#define LORA_RST 9 // Pin Reset ของ Lora Module
+#define LORA_DIO0 2 // Pin DIO0 ของ Lora Module
+#define SD_CS 4 // Pin ของ SD Card
 
-// GPS module using SoftwareSerial
-SoftwareSerial gpsSerial(4, 3);  // GPS: RX = 4, TX = 3
+MPU6050 mpu;
 TinyGPSPlus gps;
+SoftwareSerial ss(RXPin, TXPin);
+OV7670 cam;
 
-// Servo for shock chord deployment
-Servo shockServo;
-const int servoPin = 6;
-bool chordDeployed = false;
-
-// MQ-135 Gas Sensor (Analog)
-const int gasSensorPin = A0;
-
-// Dummy Accelerometer values (replace with sensor’s library)
-float ax = 0, ay = 0, az = 0;
-
-// SD Card module chip select pin
-const int SD_CS = 8;
-
-// (OV7670 Camera Module)
-// Note: The OV7670 typically requires many signals (e.g., XCLK, D0-D7, HREF, VSYNC, PCLK).
-// Here we assume a library/firmware handles the low-level interface.
+float Ro_NH3 = 10.0; // ค่า Ro ของ NH3 ที่ปรับเทียบแล้ว
+float Ro_NOx = 10.0; // ค่า Ro ของ NH3 ที่ปรับเทียบแล้ว
 
 void setup() {
-    Serial.begin(9600);
-    while (!Serial);
-
-    // Initialize SD card for image storage
-    if (!SD.begin(SD_CS)) {
-        Serial.println("SD card initialization failed!");
-    }
-    else {
-        Serial.println("SD card initialized.");
-    }
-
-    // Initialize LoRa module via SPI
-    SPI.begin();
-    LoRa.setPins(LORA_SS, LORA_RST, LORA_DIO0);
-    if (!LoRa.begin(915E6)) {  // Frequency: 915 MHz (adjust as needed)
-        Serial.println("LoRa initialization failed!");
-        while (1);
-    }
-    Serial.println("LoRa initialized.");
-
-    // Initialize GPS
-    gpsSerial.begin(9600);
-
-    // Initialize servo (start at 0°)
-    shockServo.attach(servoPin);
-    shockServo.write(0);
-
-    // Initialize I2C (for accelerometer, etc.)
+    Serial.begin(115200);
     Wire.begin();
+    ss.begin(GPSBaud);
+
+    LoRa.setPins(LORA_SS, LORA_RST, LORA_DIO0);
+    if (!LoRa.begin(915E6)) Serial.println("LoRa init failed!"); // เรื่มการทำงานของ LoRa และแสดงผลหากเกิดข้อผิดพลาด
+    if (!SD.begin(SD_CS)) Serial.println("SD Card init failed!"); // เรื่มการทำงานของ SD card และแสดงผลหากเกิดข้อผิดพลาด
+
+    mpu.initialize(); 
+    if (!mpu.testConnection()) Serial.println("MPU6050 connection failed!"); // เรื่มการทำงานของ MPU6050 ละแสดงผลหากเกิดข้อผิดพลาด
+
+    Ro_NH3 = calibrateSensor(MQ135_NH3_Pin); // ปรับค่า Ro ของ NH3
+    Ro_NOx = calibrateSensor(MQ135_NOx_Pin); // ปรับค่า Ro ของ NOx
+
+    cam.init(); // เริ้มการทำงานของกล้อง OV7670
+    cam.setRes(QVGA);
+    cam.setColorSpace(YUV422);
 }
 
 void loop() {
-    // 1. Read dummy accelerometer values (replace with actual sensor reads)
-    readAccelerometer();
+    int16_t ax, ay, az, gx, gy, gz;
+    mpu.getMotion6(&ax, &ay, &az, &gx, &gy, &gz); 
+    float NH3_ppm = getGasPPM(MQ135_NH3_Pin, Ro_NH3, 116.6, -2.76); // อ่านค่าความเข้มข่นของ NH3
+    float NOx_ppm = getGasPPM(MQ135_NOx_Pin, Ro_NOx, 220.0, -2.3); // อ่านค่าความเข้มข่นของ NOx
 
-    // 2. Read gas sensor value
-    int gasValue = analogRead(gasSensorPin);
+    while (ss.available() > 0) gps.encode(ss.read()); // อ่านค่า GPS
+    String data = "";
 
-    // 3. Process incoming GPS data
-    while (gpsSerial.available() > 0) {
-        gps.encode(gpsSerial.read());
-    }
-    double latitude = gps.location.isValid() ? gps.location.lat() : 0.0;
-    double longitude = gps.location.isValid() ? gps.location.lng() : 0.0;
-    double altitude = gps.altitude.isValid() ? gps.altitude.meters() : 0.0;
-
-    // 4. Deploy shock chord if altitude >= 500m and not already deployed
-    if (!chordDeployed && altitude >= 500) {
-        shockServo.write(90);  // Adjust angle to trigger  mechanism
-        chordDeployed = true;
-        Serial.println("Shock chord deployed!");
+    if (gps.location.isValid()) { //หากพบตำแหน่งจากดาวเทียม
+        data += "Lat:" + String(gps.location.lat(), 6) + " ";
+        data += "Lng:" + String(gps.location.lng(), 6) + " ";
+        data += "Alt:" + String(gps.altitude.meters()) + "m ";
+        data += "Sat:" + String(gps.satellites.value()) + " ";
     }
 
-    // 5. Capture an image from the OV7670 (simulated) after deployment
-    if (chordDeployed) {
-        captureImage();
-    }
-
-    // 6. Create a data packet to send via LoRa
-    String dataPacket = "LAT:" + String(latitude, 6) +
-        ",LON:" + String(longitude, 6) +
-        ",ALT:" + String(altitude, 2) +
-        ",AX:" + String(ax, 2) +
-        ",AY:" + String(ay, 2) +
-        ",AZ:" + String(az, 2) +
-        ",GAS:" + String(gasValue);
-
+    data += "NH3:" + String(NH3_ppm) + "ppm ";
+    data += "NOx:" + String(NOx_ppm) + "ppm ";
+    data += "AccelX:" + String(ax) + " ";
+    data += "AccelY:" + String(ay) + " ";
+    data += "AccelZ:" + String(az);
+    
     LoRa.beginPacket();
-    LoRa.print(dataPacket);
+    LoRa.print(data); // ส่งข้อมูลผ่าน Lora Module
     LoRa.endPacket();
-    Serial.println("Data sent: " + dataPacket);
-
-    delay(1000);  // Adjust as necessary
+    Serial.println("Sent: " + data);
+    delay(2000);
 }
 
-void readAccelerometer() {
-    // Dummy accelerometer values (simulate readings)
-    ax = random(-100, 100) / 100.0;
-    ay = random(-100, 100) / 100.0;
-    az = random(900, 1100) / 100.0;  // Approximately 1g on Z-axis
+// ปรับเทียบโดยการคำนวนค่า Ro ในอากาศบริสุทธิ์
+float calibrateSensor(int pin) {
+    float val = 0;
+    for (int i = 0; i < 100; i++) {
+        val += analogRead(pin);
+        delay(50);
+    }
+    val = val / 100;  // เฉลี่ยค่าที่อ่าน
+    float Rs_air = (1023.0 / val) - 1.0;  // คำนวนค่า resistance ในอากาศบริสุทธิ์
+    return Rs_air / 3.6;  // 3.6 คืออัตราส่วนตาม MQ-135 DataSheet
 }
 
-void captureImage() {
-    // --- Placeholder for OV7670 Image Capture ---
-    // In a real scenario, you would use an OV7670 library to grab a frame and save it.
-    Serial.println("Capturing image from OV7670...");
-
-    // Create a unique filename based on millis()
-    String filename = "IMG" + String(millis()) + ".bmp";
-    File imgFile = SD.open(filename, FILE_WRITE);
-    if (imgFile) {
-        // Simulate writing image data (replace with actual image capture code)
-        imgFile.println("This is a dummy image captured from OV7670.");
-        imgFile.close();
-        Serial.println("Image saved as " + filename);
-    }
-    else {
-        Serial.println("Error opening file " + filename);
-    }
+// เปลี่ยนเป็นค่า ppm ตามความ curve ของแก๊ซ
+float getGasPPM(int pin, float Ro, float A, float B) {
+    int sensorValue = analogRead(pin);
+    float Rs = (1023.0 / sensorValue) - 1.0;
+    Rs = Ro / Rs;
+    return A * pow(Rs, B);  // คำนวนค่า Sensitivity
 }
